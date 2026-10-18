@@ -42,6 +42,11 @@ an evidence string naming the rule is recorded. Consequences:
   are marked `external`; the system does not read installed packages, so calls
   into libraries have no in-repo target. Builtins are recorded as `external`
   (e.g., `builtin:len`).
+- **Duplicate definitions are not resolved to a single binding.** When the same
+  qualified name is defined more than once, every relationship that would
+  resolve to it is reported as `ambiguous` (never `resolved_static`), because
+  the model does not track execution order or control flow. The distinct
+  definitions retain distinct identities and source locations.
 - **No cross-repository resolution.** Each repository is analyzed in isolation;
   a call into another registered repository is not linked.
 - **Monkey-patching, decorators that rebind names, and metaprogramming are not
@@ -178,7 +183,7 @@ treat absence of an edge as proof the call does not happen.
 
 ## 11. Testing and quality gates (honest statement)
 
-- The suite passes **139 tests with 2 skipped** on the development host
+- The suite passes **145 tests with 2 skipped** on the development host
   (CPython 3.13, Windows); the 2 skips are the symlink-creation tests above.
 - `ruff` and `mypy` are configured and clean on the current tree; mypy is
   best-effort type checking, not a proof of correctness.

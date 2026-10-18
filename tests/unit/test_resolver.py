@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from repolens.analysis.pipeline import AnalysisPipeline
 from repolens.config import Settings
 from repolens.core.models import RelationshipType, ResolutionStatus
@@ -82,3 +84,79 @@ def test_relationship_ids_are_unique_within_a_run():
         outcome = _outcome(name)
         ids = [r.relationship_id for r in outcome.relationships]
         assert len(ids) == len(set(ids))
+
+
+def _write_repo(tmp_path: Path, files: dict[str, str]) -> Path:
+    for rel, text in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def test_duplicate_module_definitions_are_not_falsely_resolved(tmp_path: Path):
+    root = _write_repo(
+        tmp_path,
+        {
+            "m.py": (
+                "def target():\n    return 'first'\n\n"
+                "def target():\n    return 'second'\n\n"
+                "def caller():\n    return target()\n"
+            )
+        },
+    )
+    outcome = AnalysisPipeline(Settings()).analyze("repo_dup", root)
+    calls = [r for r in outcome.relationships if r.rel_type is RelationshipType.CALLS]
+    assert calls, "expected a call relationship"
+    # The duplicate name must not be reported as a certain resolved_static target.
+    dup_calls = [c for c in calls if c.call_expr == "target"]
+    assert dup_calls, "expected a call to the duplicated name"
+    for c in dup_calls:
+        assert c.resolution_status is ResolutionStatus.AMBIGUOUS
+        assert c.target_symbol_id is None
+
+
+def test_duplicate_definitions_retain_distinct_symbol_ids(tmp_path: Path):
+    root = _write_repo(
+        tmp_path,
+        {"m.py": "def f():\n    return 1\n\ndef f():\n    return 2\n"},
+    )
+    outcome = AnalysisPipeline(Settings()).analyze("repo_dup2", root)
+    symbols = [s for f in outcome.files for s in f.symbols if s.qualified_name == "m.f"]
+    assert len(symbols) == 2
+    assert len({s.symbol_id for s in symbols}) == 2
+
+
+def test_same_named_definitions_in_different_modules_resolve_to_own(tmp_path: Path):
+    root = _write_repo(
+        tmp_path,
+        {
+            "a.py": "def target():\n    return 'a'\n\ndef caller():\n    return target()\n",
+            "b.py": "def target():\n    return 'b'\n\ndef caller():\n    return target()\n",
+        },
+    )
+    outcome = AnalysisPipeline(Settings()).analyze("repo_multi", root)
+    calls = [r for r in outcome.relationships if r.rel_type is RelationshipType.CALLS]
+    # Each call resolves to its own module's definition, never cross-wired.
+    for c in calls:
+        assert c.resolution_status is ResolutionStatus.RESOLVED_STATIC
+        assert c.target_symbol_id is not None
+        assert c.target_ref.startswith(("a.target", "b.target"))
+
+
+def test_same_named_methods_in_different_classes_resolve_to_own(tmp_path: Path):
+    root = _write_repo(
+        tmp_path,
+        {
+            "m.py": (
+                "class A:\n    def run(self):\n        return 1\n\n"
+                "class B:\n    def run(self):\n        return 2\n\n"
+                "def use(a, b):\n    return a.run() + b.run()\n"
+            )
+        },
+    )
+    outcome = AnalysisPipeline(Settings()).analyze("repo_cls", root)
+    symbols = [s for f in outcome.files for s in f.symbols]
+    runs = [s for s in symbols if s.name == "run"]
+    assert len(runs) == 2
+    assert len({s.symbol_id for s in runs}) == 2

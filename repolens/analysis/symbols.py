@@ -189,7 +189,9 @@ class _SymbolExtractor:
                 self._walk_body(
                     stmt.orelse, parent_qualified=parent_qualified, parent_is_class=parent_is_class
                 )
-            elif isinstance(stmt, ast.Try):
+            elif isinstance(stmt, ast.Try) or (
+                getattr(ast, "TryStar", None) is not None and isinstance(stmt, ast.TryStar)
+            ):
                 self._walk_body(
                     stmt.body, parent_qualified=parent_qualified, parent_is_class=parent_is_class
                 )
@@ -204,6 +206,15 @@ class _SymbolExtractor:
                 for handler in stmt.handlers:
                     self._walk_body(
                         handler.body,
+                        parent_qualified=parent_qualified,
+                        parent_is_class=parent_is_class,
+                    )
+            elif getattr(ast, "Match", None) is not None and isinstance(stmt, ast.Match):
+                # match/case does not introduce a new lexical scope; definitions
+                # inside a case body belong to the enclosing scope.
+                for case in stmt.cases:
+                    self._walk_body(
+                        case.body,
                         parent_qualified=parent_qualified,
                         parent_is_class=parent_is_class,
                     )

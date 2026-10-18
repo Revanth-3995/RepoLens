@@ -53,8 +53,11 @@ class GraphBuilder:
     relationships: list[RelationshipDraft] | list[Any]
     node_prefix: str = ""  # unused; ids are already prefixed
 
-    def build(self) -> nx.DiGraph:
-        g = nx.DiGraph()
+    def build(self) -> nx.MultiDiGraph:
+        # MultiDiGraph: a node pair may carry several distinct relationship
+        # types (e.g. inherits_from + calls). A plain DiGraph would silently
+        # overwrite one with the other via add_edge.
+        g = nx.MultiDiGraph()
         g.graph["repo_id"] = self.repo_id
         repo_node = f"repo_{self.repo_id}"
         g.add_node(repo_node, type="repository", label=self.repo_id)
@@ -171,8 +174,16 @@ class GraphBuilder:
                 raise GraphIntegrityError(
                     f"edge references non-existent node: src={src} tgt={tgt} type={rtype}"
                 )
-            if g.has_edge(src, tgt) and g.edges[src, tgt].get("type") == rtype:
-                g.edges[src, tgt]["sites"].extend(sites)
+            # Merge into an existing parallel edge of the SAME type; otherwise
+            # add a new parallel edge so distinct types coexist (no overwrite).
+            existing_key = None
+            edge_data = g.get_edge_data(src, tgt) or {}
+            for key, data in edge_data.items():
+                if data.get("type") == rtype:
+                    existing_key = key
+                    break
+            if existing_key is not None:
+                g.edges[src, tgt, existing_key]["sites"].extend(sites)
             else:
                 g.add_edge(src, tgt, type=rtype, sites=sites)
 
@@ -191,7 +202,11 @@ class GraphBuilder:
             if ntype in {"class", "function", "method"}:
                 if data.get("file_id") not in g:
                     raise GraphIntegrityError(f"symbol node {nid} has no file node")
-                if not any(g.edges[p, nid].get("type") == "contains" for p in g.predecessors(nid)):
+                if not any(
+                    ed.get("type") == "contains"
+                    for p in g.predecessors(nid)
+                    for ed in (g.get_edge_data(p, nid) or {}).values()
+                ):
                     raise GraphIntegrityError(f"symbol node {nid} not contained anywhere")
             if ntype == "file" and data.get("rel_path") is None:
                 raise GraphIntegrityError(f"file node {nid} missing rel_path")

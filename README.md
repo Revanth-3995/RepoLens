@@ -90,7 +90,7 @@ The full surface, with examples and the error envelope, is in
 ## Quality gates
 
 ```bash
-python -m pytest            # 139 tests, 2 skipped (unit + integration)
+python -m pytest            # 145 tests, 2 skipped (unit + integration)
 python -m ruff check .      # lint
 python -m mypy repolens     # type check
 ```

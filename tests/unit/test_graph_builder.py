@@ -58,7 +58,11 @@ def test_symbols_are_contained_somewhere():
     for nid, data in graph.nodes(data=True):
         if data.get("type") in {"class", "function", "method"}:
             assert any(
-                graph.edges[p, nid].get("type") == "contains" for p in graph.predecessors(nid)
+                any(
+                    ed.get("type") == "contains"
+                    for ed in (graph.get_edge_data(p, nid) or {}).values()
+                )
+                for p in graph.predecessors(nid)
             )
 
 
@@ -76,6 +80,29 @@ def test_sites_are_merged_for_duplicate_edges():
     for _, _, data in graph.edges(data=True):
         if data.get("type") == "calls":
             assert data.get("sites")
+
+
+def test_distinct_relationship_types_between_same_nodes_both_survive():
+    """F2 regression: inherits_from + calls on the same node pair must not overwrite."""
+    source = "class Base:\n    pass\n\nclass Child(Base):\n    Base()\n"
+    import tempfile
+    from pathlib import Path
+
+    d = Path(tempfile.mkdtemp())
+    (d / "m.py").write_text(source, encoding="utf-8")
+    from repolens.analysis.pipeline import AnalysisPipeline
+    from repolens.config import Settings
+
+    outcome = AnalysisPipeline(Settings()).analyze("repo_f2", d)
+    symbols = [s for f in outcome.files for s in f.symbols]
+    graph = GraphBuilder("repo_f2", outcome.files, symbols, outcome.relationships).build()
+    child = next(s.symbol_id for s in symbols if s.name == "Child")
+    base = next(s.symbol_id for s in symbols if s.name == "Base")
+    edge_types = {
+        data.get("type") for u, v, data in graph.edges(data=True) if u == child and v == base
+    }
+    assert "inherits_from" in edge_types
+    assert "calls" in edge_types
 
 
 def test_unknown_file_reference_fails_integrity():

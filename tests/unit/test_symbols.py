@@ -88,6 +88,35 @@ def test_line_ranges_include_decorators():
     assert cls.end_line >= cls.start_line
 
 
+def test_nested_definitions_in_match_and_try_star():
+    source = """def dispatch(value):
+    match value:
+        case 1:
+            def handle_one():
+                return 1
+        case _:
+            def handle_default():
+                return 0
+
+def try_star():
+    try:
+        pass
+    except* ValueError as eg:
+        def on_err():
+            return eg
+"""
+    table = extract_symbols(ast.parse(source), "m", len(source.splitlines()))
+    names = {d.qualified_name for d in table.drafts}
+    assert "m.dispatch.handle_one" in names
+    assert "m.dispatch.handle_default" in names
+    assert "m.try_star.on_err" in names
+    # Correct parent attachment.
+    ho = table.get("m.dispatch.handle_one")
+    assert ho is not None and ho.parent_qualified == "m.dispatch"
+    oe = table.get("m.try_star.on_err")
+    assert oe is not None and oe.parent_qualified == "m.try_star"
+
+
 def test_duplicate_definitions_get_distinct_ordinals():
     source = "def f():\n    return 1\n\ndef f():\n    return 2\n"
     table = extract_symbols(ast.parse(source), "m", 5)

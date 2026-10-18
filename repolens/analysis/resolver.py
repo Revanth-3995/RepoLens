@@ -24,6 +24,7 @@ from __future__ import annotations
 import builtins
 import re
 import sys
+from collections import Counter
 from typing import Any
 
 from repolens.analysis.modules import resolve_relative_module
@@ -89,6 +90,12 @@ class Resolver:
                 self._sym_by_q.setdefault(s.qualified_name, s)
                 if s.symbol_id:
                     self._file_of_symbol.setdefault(s.symbol_id, f)
+        # Qualified names that have more than one definition: the resolver
+        # cannot statically determine which binding is active, so any
+        # relationship that would resolve to such a name is reported as
+        # ambiguous instead of resolved_static.
+        q_counts = Counter(s.qualified_name for f in self.files for s in f.symbols)
+        self._duplicate_qnames: set[str] = {q for q, n in q_counts.items() if n > 1}
         # (rel_path, scope_qualified) -> {name: _Bind}
         self._bindings: dict[tuple[str, str], dict[str, _Bind]] = {}
         # params per function scope: (rel_path, scope) -> set of names
@@ -420,6 +427,15 @@ class Resolver:
                 evidence=evidence,
             )
 
+        def ambiguous(ref: str, evidence: str) -> RelationshipDraft:
+            return RelationshipDraft(
+                **base,
+                resolution_status=ResolutionStatus.AMBIGUOUS,
+                target_ref=ref,
+                target_symbol_id=None,
+                evidence=evidence,
+            )
+
         if imp.kind == "import":
             mod = imp.module
             ref = f"{mod} as {imp.alias}" if imp.alias else mod
@@ -476,7 +492,16 @@ class Resolver:
                 continue
             sym = self._sym_by_q.get(f"{target}.{name}")
             if sym is not None:
-                out.append(resolved(ref, sym.symbol_id, f"internal symbol {target}.{name}"))
+                if sym.qualified_name in self._duplicate_qnames:
+                    out.append(
+                        ambiguous(
+                            ref,
+                            f"imported name {target}.{name} has multiple definitions; "
+                            "static binding indeterminate",
+                        )
+                    )
+                else:
+                    out.append(resolved(ref, sym.symbol_id, f"internal symbol {target}.{name}"))
             else:
                 # module itself resolved; the name may be a variable/re-export
                 out.append(
@@ -798,6 +823,16 @@ class Resolver:
                     continue
                 for base_text in s.bases:
                     target, status, evidence = self._resolve_base(f, s, base_text)
+                    if (
+                        status is ResolutionStatus.RESOLVED_STATIC
+                        and target is not None
+                        and target.qualified_name in self._duplicate_qnames
+                    ):
+                        target = None
+                        status = ResolutionStatus.AMBIGUOUS
+                        evidence = (
+                            f"base {base_text}: multiple definitions; static binding indeterminate"
+                        )
                     rels.append(
                         RelationshipDraft(
                             rel_type=RelationshipType.INHERITS_FROM,
@@ -820,6 +855,17 @@ class Resolver:
     def _resolved(
         self, base: dict, call: CallRecord, target: SymbolDraft, evidence: str
     ) -> RelationshipDraft:
+        if target.qualified_name in self._duplicate_qnames:
+            return RelationshipDraft(
+                **base,
+                resolution_status=ResolutionStatus.AMBIGUOUS,
+                target_ref=call.func_repr,
+                target_symbol_id=None,
+                evidence=(
+                    f"multiple definitions named {target.qualified_name}; "
+                    "static binding indeterminate"
+                ),
+            )
         return RelationshipDraft(
             **base,
             resolution_status=ResolutionStatus.RESOLVED_STATIC,

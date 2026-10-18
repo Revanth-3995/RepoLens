@@ -41,7 +41,7 @@ and locked down with regression tests before the verdict was issued.
 
 | Gate | Command | Result |
 |---|---|---|
-| Tests | `python -m pytest tests -o addopts="" -p no:cacheprovider` | **141 collected — 139 passed, 2 skipped** |
+| Tests | `python -m pytest tests -o addopts="" -p no:cacheprovider` | **147 collected - 145 passed, 2 skipped** |
 | Lint | `python -m ruff check .` | `All checks passed!` |
 | Format | `python -m ruff format --check .` | `60 files already formatted` |
 | Types | `python -m mypy repolens` | `Success: no issues found in 36 source files` |
@@ -225,7 +225,7 @@ not missed.
 
 ```
 > python -m pytest tests -o addopts="" -p no:cacheprovider
-======================= 139 passed, 2 skipped in 13.40s ========================
+======================= 145 passed, 2 skipped in 13.12s ========================
 
 > python -m ruff check .
 All checks passed!
@@ -258,3 +258,32 @@ Open, intentional limitations — no auth, Python-only, incomplete-by-design
 resolution, latest-run-only detail, rebuilt-per-request graph, two
 privilege-skipped symlink tests — are listed in §4 and in
 [`limitations.md`](limitations.md). Verdict: **COMPLETE**.
+
+---
+
+## Subsequent correctness audit (2026-10-18)
+
+A later source review identified three additional defects, all confirmed and fixed
+before this note was added. They are recorded in full in
+[`phase-1-correctness-audit.md`](phase-1-correctness-audit.md):
+
+- **F1 — duplicate-definition resolution.** `Resolver` used `setdefault` on a
+  qualified-name index, so a call to a redefined name was falsely marked
+  `resolved_static` against the first definition. Fix: qualified names with more
+  than one definition are detected and such relationships are reported
+  `ambiguous`.
+- **F2 — typed graph-edge overwriting.** `GraphBuilder` used `nx.DiGraph`,
+  which allows one edge per node pair, so a second relationship type sharing
+  the same pair overwrote the first. Fix: switched to `nx.MultiDiGraph` with
+  per-type merge and parallel-edge queries.
+- **F3 — missing AST statement containers.** `_walk_body` omitted `ast.Match`
+  case bodies and `ast.TryStar` handlers. Fix: both are now traversed.
+
+Regression tests added:
+`test_duplicate_module_definitions_are_not_falsely_resolved`,
+`test_distinct_relationship_types_between_same_nodes_both_survive`,
+`test_nested_definitions_in_match_and_try_star` (plus three supporting tests).
+
+Final verification after these fixes: **145 passed, 2 skipped**; ruff, format,
+and mypy clean. See `phase-1-correctness-audit.md` for the full table and
+evidence.

@@ -23,7 +23,7 @@ from repolens.core.models import (
 )
 
 
-def _node(g: nx.DiGraph, node_id: str) -> GraphNode:
+def _node(g: nx.MultiDiGraph, node_id: str) -> GraphNode:
     data = dict(g.nodes[node_id])
     ntype = data.pop("type", "file")
     label = data.pop("label", node_id)
@@ -36,9 +36,11 @@ def _edge(src: str, tgt: str, data: dict[str, Any]) -> GraphEdge:
 
 
 class GraphQuery:
-    """Query facade over a built NetworkX DiGraph."""
+    """Query facade over a built NetworkX MultiDiGraph."""
 
-    def __init__(self, g: nx.DiGraph, *, max_depth: int = 6, max_visited: int = 20_000) -> None:
+    def __init__(
+        self, g: nx.MultiDiGraph, *, max_depth: int = 6, max_visited: int = 20_000
+    ) -> None:
         self.g = g
         self.max_depth = max(1, min(max_depth, 10))
         self.max_visited = max(100, max_visited)
@@ -74,12 +76,14 @@ class GraphQuery:
         root = _node(self.g, node_id)
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[Any] = set()
 
         def collect(neighbor: str, src: str, tgt: str, data: dict[str, Any]) -> None:
             if edge_type and data.get("type") != edge_type:
                 return
-            key = (src, tgt)
+            # Dedupe by (src, tgt, type) so parallel edges of different types
+            # all survive while identical (src, tgt, type) pairs stay merged.
+            key = (src, tgt, data.get("type"))
             if key in seen:
                 return
             seen.add(key)
@@ -88,14 +92,22 @@ class GraphQuery:
 
         if direction in (Direction.OUT, Direction.BOTH):
             for nbr in self.g.successors(node_id):
-                if len(nodes) >= limit:
+                if len(edges) >= limit:
                     break
-                collect(nbr, node_id, nbr, self.g.edges[node_id, nbr])
+                edata = self.g.get_edge_data(node_id, nbr) or {}
+                for _key, data in edata.items():
+                    if len(edges) >= limit:
+                        break
+                    collect(nbr, node_id, nbr, data)
         if direction in (Direction.IN, Direction.BOTH):
             for nbr in self.g.predecessors(node_id):
-                if len(nodes) >= limit:
+                if len(edges) >= limit:
                     break
-                collect(nbr, nbr, node_id, self.g.edges[nbr, node_id])
+                edata = self.g.get_edge_data(nbr, node_id) or {}
+                for _key, data in edata.items():
+                    if len(edges) >= limit:
+                        break
+                    collect(nbr, nbr, node_id, data)
         return root, nodes, edges
 
     def edges(self, *, edge_type: str | None = None, limit: int = 100) -> list[GraphEdge]:
