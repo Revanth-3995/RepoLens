@@ -71,3 +71,34 @@ def analyze(client: TestClient, repo_id: str) -> dict:
     response = client.post(f"/api/repositories/{repo_id}/analysis")
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def make_repo(root: Path, files: dict[str, str], name: str = "repo") -> Path:
+    """Create a temporary repository from a mapping of POSIX paths to source."""
+    repo = root / name
+    for rel_path, content in files.items():
+        target = repo / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    repo.mkdir(parents=True, exist_ok=True)
+    return repo
+
+
+def analyzed_temp_repo(client: TestClient, root: Path, files: dict[str, str]) -> str:
+    """Register and analyze a temporary repository; return its id."""
+    repo = make_repo(root, files)
+    response = client.post("/api/repositories", json={"name": "tmp", "path": str(repo)})
+    assert response.status_code == 201, response.text
+    repo_id = response.json()["id"]
+    analyze(client, repo_id)
+    return repo_id
+
+
+def symbol_id_for(client: TestClient, repo_id: str, qualified_name: str) -> str:
+    """Look up a symbol id by exact qualified name in the latest run."""
+    response = client.get(f"/api/repositories/{repo_id}/symbols", params={"limit": 500})
+    assert response.status_code == 200, response.text
+    for item in response.json()["items"]:
+        if item["qualified_name"] == qualified_name:
+            return str(item["id"])
+    raise AssertionError(f"symbol {qualified_name!r} not found")

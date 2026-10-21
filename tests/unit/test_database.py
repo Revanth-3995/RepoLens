@@ -23,6 +23,7 @@ def test_expected_tables_exist(db: Database):
         "files",
         "symbols",
         "relationships",
+        "function_metrics",
         "analysis_errors",
     } <= _tables(db)
 
@@ -34,6 +35,55 @@ def test_expected_indexes_exist(db: Database):
     assert "idx_files_repo_run" in names
     assert "idx_symbols_run_name" in names
     assert "idx_rels_run_type" in names
+    assert "idx_fm_run" in names
+    assert "idx_fm_repo_run" in names
+    assert "idx_fm_symbol" in names
+
+
+def test_function_metrics_statement_count_is_added_to_older_schema(tmp_path):
+    path = tmp_path / "older.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (version INTEGER PRIMARY KEY);
+        INSERT INTO schema_meta (version) VALUES (2);
+        CREATE TABLE function_metrics (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repository_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          file_id TEXT NOT NULL,
+          symbol_id TEXT NOT NULL DEFAULT '',
+          qualified_name TEXT NOT NULL,
+          start_line INTEGER NOT NULL,
+          end_line INTEGER NOT NULL,
+          parameter_count INTEGER NOT NULL DEFAULT 0,
+          line_count INTEGER NOT NULL DEFAULT 0,
+          if_count INTEGER NOT NULL DEFAULT 0,
+          for_count INTEGER NOT NULL DEFAULT 0,
+          while_count INTEGER NOT NULL DEFAULT 0,
+          try_count INTEGER NOT NULL DEFAULT 0,
+          with_count INTEGER NOT NULL DEFAULT 0,
+          match_count INTEGER NOT NULL DEFAULT 0,
+          return_count INTEGER NOT NULL DEFAULT 0,
+          call_count INTEGER NOT NULL DEFAULT 0,
+          max_nesting_depth INTEGER NOT NULL DEFAULT 0,
+          cyclomatic_complexity INTEGER NOT NULL DEFAULT 1
+        );
+        """
+    )
+    conn.close()
+
+    db = Database(path)
+    conn = db.connect()
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(function_metrics)").fetchall()
+        }
+        assert "statement_count" in columns
+        assert conn.execute("SELECT statement_count FROM function_metrics").fetchall() == []
+    finally:
+        db.close()
 
 
 def test_foreign_keys_enabled(db: Database):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from repolens.analysis.function_metrics import extract_function_metrics
 from repolens.analysis.imports_calls import extract_imports_and_calls
 from repolens.analysis.modules import module_name_for
 from repolens.analysis.python_parser import parse_source
@@ -47,6 +48,19 @@ def _assign_ids(repository_id: str, files: list[FileAnalysis]) -> None:
                 repository_id, f.rel_path, s.kind.value, s.qualified_name, s.ordinal
             )
             s.file_id = f.file_id
+        # Metrics are extracted before ids exist; associate them with the symbol
+        # they were computed from by qualified name and line span. Function
+        # metrics start at the ``def`` line, while symbols include decorators,
+        # so the end line is the stable key; start line is a fallback for a
+        # function decorator that is edited concurrently with analysis.
+        symbols_by_end = {(s.qualified_name, s.end_line): s.symbol_id for s in f.symbols}
+        symbols_by_start = {(s.qualified_name, s.start_line): s.symbol_id for s in f.symbols}
+        for m in f.function_metrics:
+            m.file_id = f.file_id
+            m.symbol_id = symbols_by_end.get(
+                (m.qualified_name, m.end_line),
+                symbols_by_start.get((m.qualified_name, m.start_line), ""),
+            )
     for f in files:
         # map qualified -> symbol for parent lookup within the file
         by_q: dict[str, str] = {}
@@ -166,6 +180,7 @@ class AnalysisPipeline:
 
             table = extract_symbols(tree, module_name, _line_count(source))
             extraction = extract_imports_and_calls(tree, table.node_to_qualified, module_name)
+            metrics = extract_function_metrics(tree, table, module_name)
             outcome.files.append(
                 FileAnalysis(
                     rel_path=df.rel_path,
@@ -178,6 +193,8 @@ class AnalysisPipeline:
                     calls=extraction.calls,
                     star_import=extraction.has_star_import,
                     local_names=extraction.local_names,
+                    stable_local_defs=extraction.stable_local_defs,
+                    function_metrics=metrics,
                 )
             )
 

@@ -2,10 +2,10 @@
 
 Schema, connection management, and simple data-access helpers. Transactions:
 - PRAGMA foreign_keys=ON, journal_mode=WAL.
-- Migration hook: schema_version table (current 1).
+- Migration hook: schema_version table (current 2), with additive guards.
 - The analysis service performs the atomic detail swap in a single
-  transaction (deleting old run details after inserting the new ones, then
-  marking the new run completed).
+  transaction (deleting old run details, inserting the new ones, then marking
+  the new run completed).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Any
 
 from repolens.core.models import AnalysisSummary
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
   version INTEGER PRIMARY KEY
@@ -117,6 +117,35 @@ CREATE TABLE IF NOT EXISTS relationships (
 CREATE INDEX IF NOT EXISTS idx_rels_run_type ON relationships(run_id, rel_type);
 CREATE INDEX IF NOT EXISTS idx_rels_run_src_sym ON relationships(run_id, source_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_rels_run_tgt_sym ON relationships(run_id, target_symbol_id);
+
+CREATE TABLE IF NOT EXISTS function_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repository_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  symbol_id TEXT NOT NULL DEFAULT '',
+  qualified_name TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  parameter_count INTEGER NOT NULL DEFAULT 0,
+  line_count INTEGER NOT NULL DEFAULT 0,
+  statement_count INTEGER NOT NULL DEFAULT 0,
+  if_count INTEGER NOT NULL DEFAULT 0,
+  for_count INTEGER NOT NULL DEFAULT 0,
+  while_count INTEGER NOT NULL DEFAULT 0,
+  try_count INTEGER NOT NULL DEFAULT 0,
+  with_count INTEGER NOT NULL DEFAULT 0,
+  match_count INTEGER NOT NULL DEFAULT 0,
+  return_count INTEGER NOT NULL DEFAULT 0,
+  call_count INTEGER NOT NULL DEFAULT 0,
+  max_nesting_depth INTEGER NOT NULL DEFAULT 0,
+  cyclomatic_complexity INTEGER NOT NULL DEFAULT 1,
+  FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES analysis_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_fm_run ON function_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_fm_repo_run ON function_metrics(repository_id, run_id);
 
 CREATE TABLE IF NOT EXISTS analysis_errors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,12 +245,38 @@ class Database:
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(DDL)
-        cur = conn.execute("SELECT version FROM schema_meta ORDER BY version DESC LIMIT 1")
+        self._migrate(conn)
+        cur = conn.execute("SELECT MAX(version) AS v FROM schema_meta")
         row = cur.fetchone()
-        if row is None:
-            conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
+        current = int(row["v"]) if row is not None and row["v"] is not None else None
+        if current is None or current < SCHEMA_VERSION:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,)
+            )
             conn.commit()
-        # future migrations go here
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Idempotent, additive migrations for schemas created by older builds.
+
+        ``CREATE TABLE IF NOT EXISTS`` never adds columns to an existing table.
+        Each migration is guarded by an explicit column check so it is safe to
+        run on every connection and never rewrites user data.
+        """
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(function_metrics)").fetchall()
+        }
+        if "symbol_id" not in columns:
+            conn.execute(
+                "ALTER TABLE function_metrics ADD COLUMN symbol_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "statement_count" not in columns:
+            conn.execute(
+                "ALTER TABLE function_metrics ADD COLUMN statement_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fm_symbol ON function_metrics(symbol_id)")
+        conn.commit()
 
     @staticmethod
     def summary_to_json(s: AnalysisSummary | None) -> str:

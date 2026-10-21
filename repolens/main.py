@@ -20,21 +20,28 @@ from repolens.api.routes import api_router
 from repolens.config import Settings, configure_logging
 from repolens.core.errors import (
     AnalysisExecutionError,
+    AnalysisNotAvailableError,
     AnalysisRunNotFoundError,
     FileNotFoundError_,
     GraphIntegrityError,
     GraphNodeNotFoundError,
     InvalidRepositoryPathError,
+    InvalidRequestError,
     PathTraversalError,
     RepoLensError,
     RepositoryExistsError,
     RepositoryNotFoundError,
+    SourceUnavailableError,
     SymbolNotFoundError,
 )
 from repolens.core.models import HealthResponse
 from repolens.persistence.database import Database
 from repolens.services.analysis_service import AnalysisService
+from repolens.services.architecture_service import ArchitectureService
+from repolens.services.comprehension_service import ComprehensionService
 from repolens.services.repository_service import RepositoryService
+from repolens.services.search_service import SearchService
+from repolens.services.trace_service import TraceService
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +52,12 @@ _STATUS_BY_ERROR: tuple[tuple[type[RepoLensError], int], ...] = (
     (FileNotFoundError_, 404),
     (SymbolNotFoundError, 404),
     (GraphNodeNotFoundError, 404),
+    (AnalysisNotAvailableError, 404),
     (RepositoryExistsError, 409),
     (InvalidRepositoryPathError, 400),
     (PathTraversalError, 400),
+    (InvalidRequestError, 400),
+    (SourceUnavailableError, 409),
     (AnalysisExecutionError, 500),
     (GraphIntegrityError, 500),
 )
@@ -72,9 +82,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="RepoLens",
         version=__version__,
         description=(
-            "Phase 1: no-LLM static analysis of local Python repositories. "
-            "Ingestion, AST parsing, conservative symbol/relationship extraction, "
-            "a code graph, and SQLite persistence."
+            "No-LLM static analysis of local Python repositories. Phase 1 covers "
+            "ingestion, AST parsing, conservative symbol/relationship extraction, "
+            "a code graph, and SQLite persistence; Phase 2 adds deterministic "
+            "metrics, CFGs, local data flow, explanations, search, tracing, and "
+            "architecture indicators."
         ),
         lifespan=lifespan,
     )
@@ -82,6 +94,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.repository_service = RepositoryService(database, settings)
     app.state.analysis_service = AnalysisService(database, settings)
+    app.state.architecture_service = ArchitectureService(app.state.analysis_service, settings)
+    app.state.comprehension_service = ComprehensionService(
+        app.state.analysis_service, settings, app.state.architecture_service
+    )
+    app.state.search_service = SearchService(app.state.analysis_service, settings)
+    app.state.trace_service = TraceService(app.state.analysis_service, settings)
 
     app.include_router(api_router, prefix="/api")
 

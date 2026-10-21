@@ -54,6 +54,31 @@ def test_reanalysis_replaces_details_and_keeps_history(service, sample_repo: Pat
     assert svc.get_run(second.id).status.value == "completed"
 
 
+def test_completed_metrics_survive_application_restart(tmp_path: Path, sample_repo: Path):
+    settings = Settings(db_path=tmp_path / "restart.db")
+    first_db = Database(settings.db_path)
+    first_db.connect()
+    repo_id = RepositoryService(first_db, settings).register("sample", str(sample_repo)).id
+    first_service = AnalysisService(first_db, settings)
+    try:
+        first_service.trigger(repo_id)
+        before, total = first_service.list_function_metrics(repo_id, limit=500)
+        assert total == 1
+        assert [(m.qualified_name, m.statement_count) for m in before] == [("app.a", 1)]
+    finally:
+        first_db.close()
+
+    second_db = Database(settings.db_path)
+    second_db.connect()
+    try:
+        second_service = AnalysisService(second_db, settings)
+        after, total = second_service.list_function_metrics(repo_id, limit=500)
+        assert total == 1
+        assert [(m.qualified_name, m.statement_count) for m in after] == [("app.a", 1)]
+    finally:
+        second_db.close()
+
+
 def test_no_duplicate_files_after_reanalysis(service):
     svc, repo_id = service
     for _ in range(3):

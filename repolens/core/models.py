@@ -142,6 +142,35 @@ class CallRecord:
 
 
 @dataclass
+class FunctionMetricsDraft:
+    """Structural metrics for one function/method (Phase 2).
+
+    All values are derived deterministically from the function's AST and
+    source locations. Nothing is inferred or guessed.
+    """
+
+    qualified_name: str
+    symbol_id: str = ""
+    file_id: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    parameter_count: int = 0
+    line_count: int = 0
+    statement_count: int = 0
+    if_count: int = 0
+    for_count: int = 0
+    while_count: int = 0
+    try_count: int = 0
+    with_count: int = 0
+    match_count: int = 0
+    return_count: int = 0
+    call_count: int = 0
+    max_nesting_depth: int = 0
+    # 1 + number of decision points (if/for/while/except/case/bool-op).
+    cyclomatic_complexity: int = 1
+
+
+@dataclass
 class FileAnalysis:
     """Everything the pipeline learned about one discovered file."""
 
@@ -157,11 +186,15 @@ class FileAnalysis:
     symbols: list[SymbolDraft] = field(default_factory=list)
     imports: list[ImportRecord] = field(default_factory=list)
     calls: list[CallRecord] = field(default_factory=list)
+    function_metrics: list[FunctionMetricsDraft] = field(default_factory=list)
     star_import: bool = False
     # qualified name of an enclosing scope -> names bound locally there
     # (assignments, loop/with targets, exception names, nested-def names).
     # Used to detect shadowing that makes conservative resolution impossible.
     local_names: dict[str, set[str]] = field(default_factory=dict)
+    # qualified name of an enclosing scope -> nested def/class names that are
+    # never rebound in that scope; only these may resolve statically.
+    stable_local_defs: dict[str, set[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -304,6 +337,31 @@ class SymbolRecord(BaseModel):
     ordinal: int = 0
 
 
+class FunctionMetricsRecord(BaseModel):
+    id: str = ""
+    repository_id: str = ""
+    run_id: str = ""
+    symbol_id: str = ""
+    file_id: str
+    rel_path: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+    parameter_count: int = 0
+    line_count: int = 0
+    statement_count: int = 0
+    if_count: int = 0
+    for_count: int = 0
+    while_count: int = 0
+    try_count: int = 0
+    with_count: int = 0
+    match_count: int = 0
+    return_count: int = 0
+    call_count: int = 0
+    max_nesting_depth: int = 0
+    cyclomatic_complexity: int = 1
+
+
 class RelationshipRecord(BaseModel):
     id: str
     repository_id: str
@@ -390,6 +448,11 @@ class PaginatedSymbols(BaseModel):
     page: PageMeta
 
 
+class PaginatedFunctionMetrics(BaseModel):
+    items: list[FunctionMetricsRecord]
+    page: PageMeta
+
+
 class PaginatedRelationships(BaseModel):
     items: list[RelationshipRecord]
     page: PageMeta
@@ -413,3 +476,366 @@ class PaginatedEdges(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: control-flow graphs
+# ---------------------------------------------------------------------------
+
+
+class CFGNodeKind(str, Enum):
+    ENTRY = "entry"
+    EXIT = "exit"
+    STATEMENT = "statement"
+    CONDITION = "condition"
+    LOOP = "loop"
+    TRY = "try"
+    HANDLER = "handler"
+    WITH = "with"
+    MATCH = "match"
+    CASE = "case"
+    MERGE = "merge"
+    RETURN = "return"
+    RAISE = "raise"
+    BREAK = "break"
+    CONTINUE = "continue"
+    NESTED_DEF = "nested_def"
+
+
+class CFGEdgeType(str, Enum):
+    NORMAL = "normal"
+    TRUE = "true"
+    FALSE = "false"
+    LOOP_BODY = "loop_body"
+    LOOP_BACK = "loop_back"
+    LOOP_EXIT = "loop_exit"
+    BREAK = "break"
+    CONTINUE = "continue"
+    RETURN = "return"
+    RAISE = "raise"
+    EXCEPTION = "exception"
+    FINALLY = "finally"
+    CASE = "case"
+    NO_MATCH = "no_match"
+
+
+class CFGNode(BaseModel):
+    """One control-flow node. Line ranges are one-based inclusive."""
+
+    id: str
+    kind: CFGNodeKind
+    label: str = ""
+    line: int | None = None
+    end_line: int | None = None
+    column: int | None = None
+    source: str | None = None
+
+
+class CFGEdge(BaseModel):
+    source: str
+    target: str
+    type: CFGEdgeType
+    line: int | None = None
+    evidence: str = ""
+
+
+class FunctionCFG(BaseModel):
+    symbol_id: str
+    qualified_name: str
+    file_id: str
+    rel_path: str
+    start_line: int
+    end_line: int
+    entry: str
+    exit: str
+    nodes: list[CFGNode] = Field(default_factory=list)
+    edges: list[CFGEdge] = Field(default_factory=list)
+    truncated: bool = False
+    source_changed_since_analysis: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: local data flow
+# ---------------------------------------------------------------------------
+
+
+class DefinitionKind(str, Enum):
+    PARAMETER = "parameter"
+    ASSIGNMENT = "assignment"
+    AUGMENTED_ASSIGNMENT = "augmented_assignment"
+    LOOP_TARGET = "loop_target"
+    WITH_TARGET = "with_target"
+    EXCEPT_NAME = "except_name"
+    IMPORT = "import"
+    NESTED_DEF = "nested_def"
+    WALRUS = "walrus"
+    DELETE = "delete"
+    PATTERN = "pattern"
+
+
+class DefinitionFact(BaseModel):
+    id: str
+    name: str
+    kind: DefinitionKind
+    node_id: str
+    line: int | None = None
+    column: int | None = None
+
+
+class UseFact(BaseModel):
+    id: str
+    name: str
+    node_id: str
+    line: int | None = None
+    column: int | None = None
+
+
+class ReachingDefinitions(BaseModel):
+    use_id: str
+    definitions: list[str] = Field(default_factory=list)
+
+
+class DefUseLink(BaseModel):
+    definition_id: str
+    uses: list[str] = Field(default_factory=list)
+
+
+class DataFlowResult(BaseModel):
+    symbol_id: str
+    qualified_name: str
+    file_id: str
+    rel_path: str
+    definitions: list[DefinitionFact] = Field(default_factory=list)
+    uses: list[UseFact] = Field(default_factory=list)
+    reaching: list[ReachingDefinitions] = Field(default_factory=list)
+    def_use: list[DefUseLink] = Field(default_factory=list)
+    # Uses with no locally reaching definition. They may be globals, builtins,
+    # closure variables, or comprehension variables; the list is a local fact,
+    # not a claim that the name is undefined at runtime.
+    undefined_uses: list[str] = Field(default_factory=list)
+    non_local_names: list[str] = Field(default_factory=list)
+    truncated: bool = False
+    source_changed_since_analysis: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: deterministic explanations
+# ---------------------------------------------------------------------------
+
+
+class ExplanationLevel(str, Enum):
+    STATEMENT = "statement"
+    FUNCTION = "function"
+    FILE = "file"
+    FOLDER = "folder"
+    PROJECT = "project"
+
+
+class EvidenceRef(BaseModel):
+    kind: str  # file | symbol | relationship | metric | cfg | line
+    rel_path: str | None = None
+    line: int | None = None
+    end_line: int | None = None
+    symbol_id: str | None = None
+    relationship_id: str | None = None
+    detail: str | None = None
+
+
+class ExplanationSection(BaseModel):
+    title: str
+    lines: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceRef] = Field(default_factory=list)
+
+
+class Explanation(BaseModel):
+    level: ExplanationLevel
+    subject: str
+    title: str
+    facts: list[str] = Field(default_factory=list)
+    heuristics: list[str] = Field(default_factory=list)
+    unknowns: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceRef] = Field(default_factory=list)
+    sections: list[ExplanationSection] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: lexical search
+# ---------------------------------------------------------------------------
+
+
+class SearchHitKind(str, Enum):
+    SYMBOL = "symbol"
+    TEXT = "text"
+
+
+class SearchMode(str, Enum):
+    ALL = "all"
+    SYMBOL = "symbol"
+    TEXT = "text"
+    IDENTIFIER = "identifier"
+    TOKEN = "token"
+
+
+class SearchHit(BaseModel):
+    kind: SearchHitKind
+    score: int
+    rel_path: str
+    line: int | None = None
+    end_line: int | None = None
+    snippet: str | None = None
+    matched_text: str | None = None
+    symbol_id: str | None = None
+    qualified_name: str | None = None
+    symbol_kind: SymbolKind | None = None
+    match_reason: str = ""
+
+
+class PaginatedSearchHits(BaseModel):
+    items: list[SearchHit]
+    page: PageMeta
+    truncated: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: cross-file tracing
+# ---------------------------------------------------------------------------
+
+
+class TraceEdge(BaseModel):
+    source_symbol_id: str
+    target_symbol_id: str | None = None
+    rel_type: RelationshipType
+    resolution_status: ResolutionStatus
+    rel_path: str
+    line: int
+    col: int
+    evidence: str
+    call_expr: str | None = None
+    target_ref: str | None = None
+
+
+class TraceNode(BaseModel):
+    symbol_id: str
+    qualified_name: str
+    kind: SymbolKind
+    rel_path: str
+    start_line: int
+    depth: int
+    via: TraceEdge | None = None
+    unresolved_references: list[TraceEdge] = Field(default_factory=list)
+
+
+class TraceResult(BaseModel):
+    repository_id: str
+    root_symbol_id: str
+    direction: Direction
+    max_depth: int
+    max_nodes: int
+    nodes: list[TraceNode] = Field(default_factory=list)
+    edges: list[TraceEdge] = Field(default_factory=list)
+    unresolved: list[TraceEdge] = Field(default_factory=list)
+    cycles: list[list[str]] = Field(default_factory=list)
+    truncated: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+class TraceConnection(BaseModel):
+    found: bool
+    source_symbol_id: str
+    target_symbol_id: str
+    nodes: list[str] = Field(default_factory=list)
+    edges: list[TraceEdge] = Field(default_factory=list)
+    length: int = 0
+    reason: str | None = None
+    truncated: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: architecture analysis
+# ---------------------------------------------------------------------------
+
+
+class FindingSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+
+
+class ArchitectureFinding(BaseModel):
+    id: str
+    kind: str
+    severity: FindingSeverity
+    title: str
+    description: str
+    subject: str
+    rel_path: str | None = None
+    symbol_id: str | None = None
+    metrics: dict[str, float | int | str] = Field(default_factory=dict)
+    evidence: list[EvidenceRef] = Field(default_factory=list)
+    heuristic: bool = True
+
+
+class DependencyEdge(BaseModel):
+    source_rel_path: str
+    target_rel_path: str
+    line: int
+    evidence: str
+
+
+class DependencyCycle(BaseModel):
+    files: list[str] = Field(default_factory=list)
+    edges: list[DependencyEdge] = Field(default_factory=list)
+
+
+class CentralComponent(BaseModel):
+    rel_path: str
+    in_degree: int
+    out_degree: int
+    degree: int
+    centrality: float
+
+
+class CouplingMetric(BaseModel):
+    rel_path: str
+    fan_in: int
+    fan_out: int
+    instability: float | None = None
+
+
+class ComplexityHotspot(BaseModel):
+    symbol_id: str | None = None
+    qualified_name: str
+    rel_path: str
+    start_line: int
+    end_line: int
+    cyclomatic_complexity: int
+    line_count: int
+    max_nesting_depth: int
+
+
+class EntryPoint(BaseModel):
+    rel_path: str
+    line: int
+    evidence: str
+
+
+class ArchitectureSummary(BaseModel):
+    repository_id: str
+    files: int = 0
+    dependency_edges: int = 0
+    cycles: list[DependencyCycle] = Field(default_factory=list)
+    central_components: list[CentralComponent] = Field(default_factory=list)
+    coupling: list[CouplingMetric] = Field(default_factory=list)
+    complexity_hotspots: list[ComplexityHotspot] = Field(default_factory=list)
+    findings: list[ArchitectureFinding] = Field(default_factory=list)
+    disconnected_components: int = 0
+    entry_points: list[EntryPoint] = Field(default_factory=list)
+    thresholds: dict[str, float | int | str] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class PaginatedFindings(BaseModel):
+    items: list[ArchitectureFinding]
+    page: PageMeta

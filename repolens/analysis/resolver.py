@@ -163,6 +163,7 @@ class Resolver:
         Returns one of:
         - ("binding", _Bind)          name is import-bound in that scope
         - ("param", scope)            name is a parameter in that scope
+        - ("local_def", scope)        name is a stable nested def/class
         - ("local", scope)            name is otherwise bound locally
         - ("miss", None)              not found in any scope
         """
@@ -172,6 +173,8 @@ class Resolver:
                 return "binding", bind
             if name in self._params.get((f.rel_path, scope), set()):
                 return "param", scope
+            if name in f.stable_local_defs.get(scope, set()):
+                return "local_def", scope
             if name in f.local_names.get(scope, set()):
                 return "local", scope
         return "miss", None
@@ -596,6 +599,45 @@ class Resolver:
                 target_ref=call.func_repr,
                 target_symbol_id=None,
                 evidence=f"receiver '{call.root_name}' is a parameter; type unknown",
+            )
+
+        if kind == "local_def":
+            candidate = self._sym_by_q.get(f"{value}.{call.root_name}")
+            if candidate is not None and call.form is CallForm.NAME:
+                if candidate.qualified_name in self._duplicate_qnames:
+                    return RelationshipDraft(
+                        **base,
+                        resolution_status=ResolutionStatus.AMBIGUOUS,
+                        target_ref=call.func_repr,
+                        target_symbol_id=None,
+                        evidence=f"nested definition {candidate.qualified_name} is duplicated",
+                    )
+                if candidate.kind in (SymbolKind.FUNCTION, SymbolKind.CLASS):
+                    return self._resolved(
+                        base,
+                        call,
+                        candidate,
+                        f"stable nested definition {candidate.qualified_name}",
+                    )
+            if (
+                candidate is not None
+                and candidate.kind is SymbolKind.CLASS
+                and len(call.attrs) == 1
+            ):
+                method = self._find_method(candidate, call.attrs[0])
+                if method is not None:
+                    return self._resolved(
+                        base,
+                        call,
+                        method,
+                        f"method lookup on nested class {candidate.qualified_name}",
+                    )
+            return RelationshipDraft(
+                **base,
+                resolution_status=ResolutionStatus.UNRESOLVED,
+                target_ref=call.func_repr,
+                target_symbol_id=None,
+                evidence=f"nested definition '{call.root_name}' in {value} has no matching target",
             )
 
         if kind == "local":

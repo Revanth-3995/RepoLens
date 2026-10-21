@@ -25,6 +25,8 @@ class SymbolTable:
     drafts: list[SymbolDraft] = field(default_factory=list)
     # id(ast node) -> qualified name of the symbol the node defines
     node_to_qualified: dict[int, str] = field(default_factory=dict)
+    # id(ast node) -> the exact draft it defines (handles duplicate names)
+    node_to_symbol: dict[int, SymbolDraft] = field(default_factory=dict)
     by_qualified: dict[tuple[str, SymbolKind], SymbolDraft] = field(default_factory=dict)
 
     def get(self, qualified_name: str, kind: SymbolKind | None = None) -> SymbolDraft | None:
@@ -113,6 +115,7 @@ class _SymbolExtractor:
         self._ordinals: Counter[tuple[str, SymbolKind]] = Counter()
         self.drafts: list[SymbolDraft] = []
         self.node_to_qualified: dict[int, str] = {}
+        self.node_to_symbol: dict[int, SymbolDraft] = {}
         self.by_qualified: dict[tuple[str, SymbolKind], SymbolDraft] = {}
 
     def run(self) -> SymbolTable:
@@ -133,6 +136,7 @@ class _SymbolExtractor:
             module_symbol=module_draft,
             drafts=list(self.drafts),
             node_to_qualified=dict(self.node_to_qualified),
+            node_to_symbol=dict(self.node_to_symbol),
             by_qualified=dict(self.by_qualified),
         )
 
@@ -256,6 +260,7 @@ class _SymbolExtractor:
         self.node_to_qualified[id(node)] = qualified
         # Nested classes inside functions use the function's qualified name as parent.
         self._walk_body(node.body, parent_qualified=qualified, parent_is_class=True)
+        self.node_to_symbol[id(node)] = draft
         del draft
 
     def _function(
@@ -268,7 +273,7 @@ class _SymbolExtractor:
         kind = SymbolKind.METHOD if parent_is_class else SymbolKind.FUNCTION
         parameters = _extract_parameters(node.args)
         signature = _signature_text(node.args, node.returns)
-        self._make(
+        draft = self._make(
             name=node.name,
             qualified=qualified,
             kind=kind,
@@ -284,6 +289,7 @@ class _SymbolExtractor:
             ],
         )
         self.node_to_qualified[id(node)] = qualified
+        self.node_to_symbol[id(node)] = draft
         self._walk_body(node.body, parent_qualified=qualified, parent_is_class=False)
 
 

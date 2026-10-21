@@ -20,6 +20,10 @@ class ExtractionResult:
     has_star_import: bool
     # enclosing function/method qualified name -> locally bound names
     local_names: dict[str, set[str]]
+    # qualified name -> names bound by a direct nested def/class and never
+    # rebound, imported, or caught elsewhere in the same scope. These can be
+    # resolved to their nested symbol without guessing.
+    stable_local_defs: dict[str, set[str]]
 
 
 def _callee_repr(node: ast.expr) -> str:
@@ -42,49 +46,82 @@ def _attribute_chain(node: ast.expr) -> tuple[str | None, tuple[str, ...]] | Non
     return current.id, tuple(parts)
 
 
-def _collect_local_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    """Names bound directly inside a function (excluding nested def bodies).
+def _collect_local_info(func: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[set[str], set[str]]:
+    """Names bound directly inside a function and its stable nested definitions.
 
     Conservative scope tracking: params are included (they shadow module-level
-    definitions); nested definitions only bind their own name.
-    """
-    bound: set[str] = set()
-    args = func.args
-    for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
-        bound.add(arg.arg)
-    if args.vararg:
-        bound.add(args.vararg.arg)
-    if args.kwarg:
-        bound.add(args.kwarg.arg)
+    definitions); nested definitions only bind their own name. Names declared
+    ``global``/``nonlocal`` are not local to this function.
 
-    def walk(node: ast.AST) -> None:
+    A nested function/class name is **stable** when it is not also a parameter,
+    imported, assigned, deleted, or bound by an ``except ... as`` target anywhere
+    in the same scope. Only stable nested definitions are candidates for static
+    call resolution.
+    """
+    declared_non_local: set[str] = set()
+
+    def collect_declarations(node: ast.AST) -> None:
+        if isinstance(node, ast.Global | ast.Nonlocal):
+            declared_non_local.update(node.names)
+            return
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            return
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-                if not isinstance(child, ast.Lambda):
-                    bound.add(child.name)
-                # do not descend into nested function bodies
-                continue
-            if isinstance(child, ast.ClassDef):
-                bound.add(child.name)
-                continue
-            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store | ast.Del):
-                bound.add(child.id)
-            # until we have proper AST typing; keep structure intact
-            handler = getattr(ast, "except_handler", None)
-            if handler and isinstance(child, handler):
-                exc = child
-                name = getattr(exc, "name", None)
-                if name:
-                    bound.add(name)
-            elif isinstance(child, ast.alias):
-                bound.add(child.asname or child.name.split(".")[0])
-            elif isinstance(child, ast.NamedExpr):
-                pass
-            walk(child)
+            collect_declarations(child)
 
     for stmt in func.body:
-        walk(stmt)
-    return bound
+        collect_declarations(stmt)
+
+    params: set[str] = set()
+    args = func.args
+    for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+        params.add(arg.arg)
+    if args.vararg:
+        params.add(args.vararg.arg)
+    if args.kwarg:
+        params.add(args.kwarg.arg)
+
+    bound: set[str] = set(params)
+    nested_defs: set[str] = set()
+    rebound: set[str] = set(params)
+
+    def add(name: str, *, nested: bool) -> None:
+        if name in declared_non_local:
+            return
+        bound.add(name)
+        if nested:
+            nested_defs.add(name)
+        else:
+            rebound.add(name)
+
+    def handle(node: ast.AST) -> None:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            add(node.name, nested=True)
+            # do not descend into nested function bodies
+            return
+        if isinstance(node, ast.ClassDef):
+            add(node.name, nested=True)
+            return
+        if isinstance(node, ast.Lambda):
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            add(node.id, nested=False)
+        if isinstance(node, ast.MatchAs | ast.MatchStar) and node.name:
+            add(node.name, nested=False)
+        if isinstance(node, ast.MatchMapping) and node.rest:
+            add(node.rest, nested=False)
+        if isinstance(node, ast.ExceptHandler):
+            if node.name:
+                add(node.name, nested=False)
+        elif isinstance(node, ast.alias):
+            add(node.asname or node.name.split(".")[0], nested=False)
+        for child in ast.iter_child_nodes(node):
+            handle(child)
+
+    for stmt in func.body:
+        handle(stmt)
+    stable = {name for name in nested_defs if name not in rebound}
+    return bound, stable
 
 
 class _ExtractionVisitor:
@@ -95,6 +132,7 @@ class _ExtractionVisitor:
         self.calls: list[CallRecord] = []
         self.has_star_import = False
         self.local_names: dict[str, set[str]] = {}
+        self.stable_local_defs: dict[str, set[str]] = {}
         parents: dict[ast.AST, ast.AST] = {}
         # NOTE: tree is passed via visit(); parents are built there once.
         self._parents = parents
@@ -111,12 +149,15 @@ class _ExtractionVisitor:
             elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 qual = self._node_to_qualified.get(id(node))
                 if qual is not None:
-                    self.local_names[qual] = _collect_local_names(node)
+                    bound, stable = _collect_local_info(node)
+                    self.local_names[qual] = bound
+                    self.stable_local_defs[qual] = stable
         return ExtractionResult(
             imports=self.imports,
             calls=self.calls,
             has_star_import=self.has_star_import,
             local_names=self.local_names,
+            stable_local_defs=self.stable_local_defs,
         )
 
     def _owner(self, node: ast.AST) -> str | None:

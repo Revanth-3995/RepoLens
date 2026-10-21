@@ -1,8 +1,12 @@
-# RepoLens — Limitations (Phase 1)
+# RepoLens — Limitations (Phase 1 and Phase 2)
 
-Status: honest, complete list of what Phase 1 does **not** do. This document is
+Status: honest, complete list of what RepoLens does **not** do. This document is
 deliberately conservative: if a capability is partial or uncertain, it is stated
 here rather than over-promised elsewhere in the docs.
+
+The Phase 1 limitations remain in force. Phase 2 adds deterministic
+comprehension features on top of the same source facts; §13 states their
+specific limits and non-goals.
 
 ## 1. Scope of language and analysis
 
@@ -119,7 +123,7 @@ treat absence of an edge as proof the call does not happen.
   completed** run's files/symbols/relationships are queryable (decision AD-2).
   Older runs' full detail sets are deleted at the atomic swap to bound storage
   and eliminate stale data.
-- Querying prior-run details is therefore not supported in Phase 1.
+- Querying prior-run details is therefore not supported in this release.
 - A `running` or `failed` run has no queryable detail set.
 
 ## 7. Analysis execution model
@@ -129,7 +133,7 @@ treat absence of an edge as proof the call does not happen.
   Large (but legal) repositories occupy the request for the run's duration.
 - **No concurrency control across registrations.** Two triggers for the same
   repository are serialized only by SQLite's write locking, not by an application
-  lock; heavy concurrent triggering is not a Phase 1 target.
+  lock; heavy concurrent triggering is not a current target.
 - **No incremental analysis.** Every run re-reads and re-parses every discovered
   file from scratch; unchanged files are not skipped via content hash (the hash
   is stored for change *reporting*, not for incremental reuse).
@@ -149,8 +153,9 @@ treat absence of an edge as proof the call does not happen.
   detected** — they are decoded as strict UTF-8 (which can succeed while leaving
   embedded NUL bytes, producing a `parse_error`) and are effectively unsupported.
 - **SQLite single-file database.** No replication, no server, no concurrent
-  multi-writer story beyond SQLite's own locking. Schema migrations are only
-  *hooked* (`schema_meta.schema_version`); no migration tooling exists yet.
+  multi-writer story beyond SQLite's own locking. Schema migrations are limited
+  to idempotent additive migrations guarded by `schema_meta.schema_version`; no
+  general migration framework exists.
 - **Thread-local connections** are not pooled; extreme thread counts create many
   connections.
 
@@ -183,13 +188,13 @@ treat absence of an edge as proof the call does not happen.
 
 ## 11. Testing and quality gates (honest statement)
 
-- The suite passes **145 tests with 2 skipped** on the development host
+- The suite passes **252 tests with 2 skipped** on the development host
   (CPython 3.13, Windows); the 2 skips are the symlink-creation tests above.
 - `ruff` and `mypy` are configured and clean on the current tree; mypy is
   best-effort type checking, not a proof of correctness.
 - Tests are deterministic and offline (no network, no GPU); they do not exercise
   truly massive repositories, OS-level concurrent triggers, or network exposure,
-  because those are outside Phase 1 scope.
+  because those are outside the supported scope.
 
 ## 12. Explicit non-goals for Phase 1
 
@@ -202,3 +207,189 @@ ML" constraint unambiguous):
 - No runtime instrumentation, no test execution, no dependency installation.
 - No distributed/multi-tenant operation.
 - No IDE/editor integration.
+
+## 13. Phase 2 comprehension limitations
+
+### 13.1 Function metrics
+
+- Cyclomatic complexity is an **AST decision-point estimate**
+  (`1 + if + for + while + except handlers + match cases + extra boolean
+  operands`). It is **not** a CFG cyclomatic number, a path count, or a defect
+  prediction.
+- Nested function/class/lambda bodies are excluded from the enclosing
+  function's counts. A very large nested function therefore does not make its
+  parent look large.
+- `max_nesting_depth` covers `if`/`for`/`while`/`try`/`with`/`match` only.
+  `try*` is treated like `try` for counting and nesting. Comprehension nesting
+  and boolean short-circuit depth are not separate nesting levels.
+- Metrics are per function/method; module-level statements have no function
+  metric record.
+- The estimate counts syntactic decisions, not runtime iterations, short
+  circuits, or exception paths.
+
+### 13.2 Control-flow graphs
+
+- The CFG is a **structural model**, not a Python bytecode CFG. It is built from
+  the current source on demand, not persisted from the analyzed snapshot.
+- Exception edges are deliberately conservative: every node created inside a
+  `try` body links to every handler. Exception types, implicit propagation,
+  handler specificity, and exception re-raise semantics are not modelled.
+- `return`, `break`, and `continue` inside `try` do **not** route through
+  `finally`. The `finally` join models normal completion and handled exception
+  paths only.
+- `match` exhaustiveness is approximated. An unguarded wildcard/name/`_` case is
+  treated as exhaustive; guards are not evaluated, so a guarded wildcard is not
+  assumed to match. Non-exhaustive matches get a `no_match` edge.
+- Statements after an unconditional terminator (`return`, `raise`, `break`,
+  `continue`) are unreachable and are omitted with a note; they are not
+  represented as if they could execute.
+- Nested definitions are represented by one `nested_def` node and are not
+  inlined into the enclosing CFG.
+- Graphs are bounded (default 5,000 nodes, 20,000 edges, depth 200). A capped
+  graph is explicitly `truncated`; it is not a claim that the omitted structure
+  does not exist.
+- Source changes since analysis are reported. If the source is deleted or
+  unreadable, CFG/data-flow return `source_unavailable` rather than stale facts.
+
+### 13.3 Local data flow
+
+- Analysis is **intraprocedural only**: it does not follow calls, returns,
+  closures, module globals, class attributes, or dynamic dispatch.
+- There is **no alias or points-to analysis**. `a = b; a.x = 1` does not update
+  `b.x`; container contents and object fields are not tracked.
+- Lambda bodies and comprehension interiors are separate scopes and are not
+  analysed. The first iterable of a comprehension and lambda defaults are
+  collected at the enclosing scope because Python evaluates them there.
+- `undefined_uses` means "no locally reaching definition". It is **not** a
+  runtime-error claim: the name may be a global, builtin, closure variable,
+  comprehension variable, or imported via a form the local analysis does not
+  model.
+- `global`/`nonlocal` names are reported separately and suppress the
+  `undefined_uses` marker; assignments to those names are still modelled as
+  definitions in the local flow for consistency with the persisted facts.
+- Reaching definitions are a **may** analysis over the CFG. Conservative
+  exception edges can make extra definitions appear to reach a use; this is
+  intentional over-approximation, not a runtime guarantee.
+- Definitions/uses are bounded (default 5,000 definitions, 10,000 uses, 50,000
+  fixpoint iterations). Truncation is explicit.
+- The analysis never claims whole-program values or that a variable is
+  uninitialized at runtime.
+
+### 13.4 Explanations
+
+- Explanations are deterministic templates over stored facts, metrics, CFG, data
+  flow and relationships. They do **not** infer programmer intent, quality, or
+  business meaning.
+- A "fact" is only as good as the underlying approximation. CFG and data-flow
+  facts inherit §13.2 and §13.3.
+- Heuristics are explicitly labelled. For example, a complexity warning is a
+  review prompt, not a defect verdict.
+- `unknowns` reports missing parse data, missing metrics, truncation, source
+  changes, and scope limits. A missing explanation is not filled with invented
+  prose.
+- File explanations can use stored metadata when source is unavailable; CFG and
+  data-flow explanations cannot and return `source_unavailable`.
+- Statement explanations use the current source and prefer a real statement node
+  over synthetic `entry`/`exit`/`merge` nodes. A blank line with no
+  source-backed node returns an unknown rather than a fabricated statement.
+
+### 13.5 Search
+
+- Search is **lexical only**. There are no embeddings, semantic similarity,
+  stemming, fuzzy matching, ranking by runtime importance, or natural-language
+  understanding.
+- `all` combines symbol matching with case-insensitive substring text search;
+  `symbol`/`identifier` do not read source; `text`/`token` read current source
+  for parsed files in the latest completed run.
+- Text search does not search deleted files, unreadable files, or files that
+  were excluded from the run. Parse-error files have no symbols and are excluded
+  from text search.
+- Empty/whitespace queries are rejected; a missing `q` is a validation error.
+  No results is an empty page, not an error.
+- Text reading is bounded (`search_max_files`, per-file size, 50 hits per file)
+  and combined hits are capped (`search_max_hits`). Truncation is reported.
+- Ranking is a documented integer heuristic. Ties break deterministically on
+  path, line, hit kind, qualified name and snippet. A high score is not a claim
+  of semantic relevance.
+- Source text may have changed since analysis. Search reports the current text
+  and does not pretend it is the analyzed snapshot.
+
+### 13.6 Tracing
+
+- Only `resolved_static` relationships with a concrete in-repository target are
+  traversed. `unresolved`, `external`, `ambiguous`, and `dynamic_or_unknown`
+  references are reported at the originating node and never followed.
+- A trace is a **static relationship path**, not a runtime call stack, execution
+  trace, or proof that a call happens. Absence of a path is bounded and
+  explicitly reported; it is not proof of nonexistence.
+- Traversal is bounded (`max_depth` 1–8, `max_nodes` 1–5,000). Hitting a cap sets
+  `truncated` and a note.
+- Cycles are reported in traversal order. Bidirectional traversal suppresses the
+  immediate reverse of the edge just traversed to avoid inventing two-node
+  cycles. Architecture import cycles are the authoritative cycle report.
+- File dependents are a reverse **import** trace mapped through resolved import
+  targets. Calls and inheritance are not file dependency edges for this view.
+- A file without a module symbol (for example a parse-error file) cannot be used
+  as a dependents root and returns `file_not_found`.
+
+### 13.7 Architecture indicators
+
+- The dependency graph uses **resolved-static imports only**. Calls are not
+  module dependencies; inheritance is not counted as an import.
+- Multiple imports of the same target file collapse to one edge; the earliest
+  `(line, evidence)` is retained.
+- Cycles are bounded simple cycles (`max_cycles` 50, `max_cycle_length` 10) and
+  canonicalized for deterministic evidence. A cycle means modules depend on each
+  other; it does **not** mean the code is wrong.
+- Degree centrality is `(in_degree + out_degree) / (N - 1)` for `N > 1`, else 0.
+  It measures graph connectivity, not importance or quality.
+- Instability is `fan_out / (fan_in + fan_out)` when the denominator is non-zero,
+  else `null`. It is a coupling indicator, not a stability guarantee.
+- Complexity hotspots use the §13.1 AST estimate. A hotspot is a review prompt,
+  not a defect.
+- Entry points are only explicit `if __name__ == "__main__"` guards and
+  `__main__.py` files, scanned within a bounded file limit. Framework entry
+  points, console scripts, and implicit imports are not discovered.
+- Findings are capped and sorted; `truncated=true` means more findings exist.
+  No metric or graph shape alone labels code defective.
+
+### 13.8 Persistence and API
+
+- Only function metrics are persisted for Phase 2. CFG, data flow, explanations,
+  search, trace and architecture are computed on demand from persisted facts plus
+  bounded current-source reads. This avoids stale derived state but means those
+  endpoints pay computation cost per request.
+- Function metrics are associated with a `symbol_id`, but the column is an
+  association string, not a foreign key. Symbol reanalysis can change IDs; old
+  metric rows are removed with the old detail set.
+- Only the latest **completed** run's details are queryable. A failed or running
+  run does not replace the previous completed run.
+- On-demand results use current source. If source changed, results report the
+  change. CFG, data-flow, function-explanation and statement-explanation
+  endpoints return `source_unavailable` when the required current source is gone;
+  file explanations report the missing source as an unknown, while search and
+  architecture simply skip unreadable files. There is no retained source
+  snapshot from analysis time.
+- Unknown repositories return 404 for Phase 2 explanation/search/trace/
+  architecture endpoints, while Phase 1-style list endpoints (including metrics)
+  return an empty page. A repository without a completed run returns
+  `analysis_not_available` for the Phase 2 endpoints.
+- Cross-repository symbol IDs are rejected rather than leaking facts from another
+  repository.
+- The API remains single-user, synchronous, unauthenticated, and local. No
+  background workers, queues, cancellation, or incremental analysis were added.
+
+### 13.9 Phase 2 non-goals
+
+The following are intentionally absent, not missing work packages:
+
+- interprocedural data flow, alias/points-to analysis, whole-program values;
+- runtime traces, coverage, profiling, dynamic dispatch, or test execution;
+- embeddings, vector search, semantic similarity, LLM explanations, or generated
+  prose;
+- automatic defect classification or quality scores from metrics;
+- executing, importing, or mutating analyzed code;
+- modeling Python exception types/finalization beyond the conservative CFG
+  approximations;
+- IDE integration, multi-language support, or distributed/multi-tenant
+  operation.

@@ -77,6 +77,24 @@ class GraphIntegrityError(RepoLensError):
     code = "graph_integrity"
 
 
+class SourceUnavailableError(RepoLensError):
+    """The analyzed source needed for on-demand analysis cannot be read."""
+
+    code = "source_unavailable"
+
+
+class AnalysisNotAvailableError(RepoLensError):
+    """A repository has no completed analysis run for the requested operation."""
+
+    code = "analysis_not_available"
+
+
+class InvalidRequestError(RepoLensError):
+    """A request is syntactically valid but semantically unsupported."""
+
+    code = "invalid_request"
+
+
 class ParseError(Exception):
     """Internal signal: a single file failed to parse (not an API error).
 

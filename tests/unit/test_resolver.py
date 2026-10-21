@@ -160,3 +160,83 @@ def test_same_named_methods_in_different_classes_resolve_to_own(tmp_path: Path):
     runs = [s for s in symbols if s.name == "run"]
     assert len(runs) == 2
     assert len({s.symbol_id for s in runs}) == 2
+
+
+def test_stable_nested_definition_call_is_resolved(tmp_path: Path):
+    root = _write_repo(
+        tmp_path,
+        {
+            "m.py": (
+                "def outer(value):\n"
+                "    def inner(x):\n"
+                "        return x + 1\n"
+                "    return inner(value)\n"
+            )
+        },
+    )
+    outcome = AnalysisPipeline(Settings()).analyze("repo_nested", root)
+    symbols = [s for f in outcome.files for s in f.symbols]
+    inner = next(s for s in symbols if s.qualified_name == "m.outer.inner")
+    calls = [
+        r
+        for r in outcome.relationships
+        if r.rel_type is RelationshipType.CALLS and r.call_expr == "inner"
+    ]
+    assert len(calls) == 1
+    call = calls[0]
+    assert call.resolution_status is ResolutionStatus.RESOLVED_STATIC
+    assert call.target_ref == "m.outer.inner"
+    assert call.target_symbol_id == inner.symbol_id
+    assert call.evidence == "stable nested definition m.outer.inner"
+
+
+def test_match_capture_rebinding_nested_definition_stays_unresolved(tmp_path: Path):
+    root = _write_repo(
+        tmp_path,
+        {
+            "m.py": (
+                "def outer(value):\n"
+                "    def inner():\n"
+                "        return 1\n"
+                "    match value:\n"
+                "        case inner:\n"
+                "            pass\n"
+                "    return inner()\n"
+            )
+        },
+    )
+    outcome = AnalysisPipeline(Settings()).analyze("repo_match_rebind", root)
+    calls = [
+        r
+        for r in outcome.relationships
+        if r.rel_type is RelationshipType.CALLS and r.call_expr == "inner"
+    ]
+    assert len(calls) == 1
+    assert calls[0].resolution_status is ResolutionStatus.DYNAMIC_OR_UNKNOWN
+    assert calls[0].target_symbol_id is None
+    assert "bound locally" in calls[0].evidence
+
+
+def test_rebound_nested_definition_call_stays_dynamic(tmp_path: Path):
+    root = _write_repo(
+        tmp_path,
+        {
+            "m.py": (
+                "def outer():\n"
+                "    def inner():\n"
+                "        return 1\n"
+                "    inner = lambda: 2\n"
+                "    return inner()\n"
+            )
+        },
+    )
+    outcome = AnalysisPipeline(Settings()).analyze("repo_rebound", root)
+    calls = [
+        r
+        for r in outcome.relationships
+        if r.rel_type is RelationshipType.CALLS and r.call_expr == "inner"
+    ]
+    assert len(calls) == 1
+    assert calls[0].resolution_status is ResolutionStatus.DYNAMIC_OR_UNKNOWN
+    assert calls[0].target_symbol_id is None
+    assert "bound locally" in calls[0].evidence

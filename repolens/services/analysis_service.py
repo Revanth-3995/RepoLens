@@ -31,6 +31,7 @@ from repolens.core.models import (
     AnalysisSummary,
     FileDetail,
     FileRecord,
+    FunctionMetricsRecord,
     IssueSeverity,
     PageMeta,
     PaginatedFiles,
@@ -163,6 +164,10 @@ class AnalysisService:
                     "DELETE FROM files WHERE repository_id = ? AND run_id != ?",
                     (rid, run_id),
                 )
+                conn.execute(
+                    "DELETE FROM function_metrics WHERE repository_id = ? AND run_id != ?",
+                    (rid, run_id),
+                )
                 conn.execute("DELETE FROM analysis_errors WHERE run_id = ?", (run_id,))
 
                 file_ids = set()
@@ -253,6 +258,41 @@ class AnalysisService:
                         "SELECT id, rel_path FROM files WHERE run_id = ?", (run_id,)
                     )
                 }
+                for f in outcome.files:
+                    if not f.file_id:
+                        continue
+                    for m in f.function_metrics:
+                        conn.execute(
+                            "INSERT INTO function_metrics (repository_id, run_id, file_id,"
+                            " symbol_id, qualified_name, start_line, end_line, parameter_count,"
+                            " line_count, statement_count, if_count, for_count, while_count,"
+                            " try_count, with_count, match_count, return_count, call_count,"
+                            " max_nesting_depth, cyclomatic_complexity)"
+                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                rid,
+                                run_id,
+                                f.file_id,
+                                m.symbol_id,
+                                m.qualified_name,
+                                m.start_line,
+                                m.end_line,
+                                m.parameter_count,
+                                m.line_count,
+                                m.statement_count,
+                                m.if_count,
+                                m.for_count,
+                                m.while_count,
+                                m.try_count,
+                                m.with_count,
+                                m.match_count,
+                                m.return_count,
+                                m.call_count,
+                                m.max_nesting_depth,
+                                m.cyclomatic_complexity,
+                            ),
+                        )
+
                 for iss in outcome.issues:
                     conn.execute(
                         "INSERT INTO analysis_errors (run_id, repository_id, file_id, severity,"
@@ -410,6 +450,18 @@ class AnalysisService:
         )
 
     # --------------------------------------------------------------- files
+
+    def list_all_files(self, rid: str) -> list[FileRecord]:
+        """All files of the latest completed run."""
+        out: list[FileRecord] = []
+        offset = 0
+        while True:
+            page = self.list_files(rid, limit=_MAX_PAGE, offset=offset)
+            out.extend(page.items)
+            offset += len(page.items)
+            if not page.items or offset >= page.page.total:
+                break
+        return out
 
     def list_files(self, rid: str, limit: int = 50, offset: int = 0) -> PaginatedFiles:
         conn = self.db.connect()
@@ -606,6 +658,146 @@ class AnalysisService:
         return self._symbol_record(conn, row)
 
     # ------------------------------------------------------- relationships
+
+    def list_function_metrics(
+        self, rid: str, limit: int = 50, offset: int = 0, *, symbol_id: str | None = None
+    ) -> tuple[list[FunctionMetricsRecord], int]:
+        """Paginated function metrics of the latest completed run."""
+        conn = self.db.connect()
+        run_id = self._latest_run_id(rid, conn)
+        if run_id is None:
+            return [], 0
+        where = "run_id = ?"
+        params: list[object] = [run_id]
+        if symbol_id:
+            where += " AND symbol_id = ?"
+            params.append(symbol_id)
+        cur = conn.execute(f"SELECT COUNT(*) AS c FROM function_metrics WHERE {where}", params)
+        total = int(cur.fetchone()["c"])
+        join_where = "fm.run_id = ?"
+        if symbol_id:
+            join_where += " AND fm.symbol_id = ?"
+        cur = conn.execute(
+            "SELECT fm.*, f.rel_path FROM function_metrics fm JOIN files f ON f.id = fm.file_id "
+            f"WHERE {join_where}"
+            " ORDER BY f.rel_path, fm.start_line, fm.qualified_name"
+            " LIMIT ? OFFSET ?",
+            [*params, min(limit, _MAX_PAGE), offset],
+        )
+        items: list[FunctionMetricsRecord] = []
+        for row in cur.fetchall():
+            items.append(
+                FunctionMetricsRecord(
+                    id=str(row["id"]),
+                    repository_id=row["repository_id"],
+                    run_id=row["run_id"],
+                    symbol_id=row["symbol_id"] or "",
+                    file_id=row["file_id"],
+                    rel_path=row["rel_path"],
+                    qualified_name=row["qualified_name"],
+                    start_line=row["start_line"],
+                    end_line=row["end_line"],
+                    parameter_count=row["parameter_count"],
+                    line_count=row["line_count"],
+                    statement_count=row["statement_count"],
+                    if_count=row["if_count"],
+                    for_count=row["for_count"],
+                    while_count=row["while_count"],
+                    try_count=row["try_count"],
+                    with_count=row["with_count"],
+                    match_count=row["match_count"],
+                    return_count=row["return_count"],
+                    call_count=row["call_count"],
+                    max_nesting_depth=row["max_nesting_depth"],
+                    cyclomatic_complexity=row["cyclomatic_complexity"],
+                )
+            )
+        return items, total
+
+    def latest_run_id(self, rid: str) -> str | None:
+        """Id of the latest completed run for a repository, or None."""
+        conn = self.db.connect()
+        return self._latest_run_id(rid, conn)
+
+    def get_function_metrics(self, symbol_id: str) -> FunctionMetricsRecord | None:
+        """Metrics for one function symbol of the latest completed run.
+
+        ``None`` is returned for non-function symbols, symbols outside the
+        latest completed run, and functions whose metrics were not produced.
+        """
+        conn = self.db.connect()
+        cur = conn.execute(
+            "SELECT fm.*, f.rel_path FROM function_metrics fm"
+            " JOIN files f ON f.id = fm.file_id"
+            " JOIN symbols s ON s.id = fm.symbol_id"
+            " JOIN analysis_runs ar ON ar.id = fm.run_id"
+            " WHERE fm.symbol_id = ? AND s.run_id = fm.run_id AND ar.status = 'completed'"
+            " ORDER BY ar.started_at DESC, fm.run_id DESC LIMIT 1",
+            (symbol_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return FunctionMetricsRecord(
+            id=str(row["id"]),
+            repository_id=row["repository_id"],
+            run_id=row["run_id"],
+            symbol_id=row["symbol_id"] or "",
+            file_id=row["file_id"],
+            rel_path=row["rel_path"],
+            qualified_name=row["qualified_name"],
+            start_line=row["start_line"],
+            end_line=row["end_line"],
+            parameter_count=row["parameter_count"],
+            line_count=row["line_count"],
+            statement_count=row["statement_count"],
+            if_count=row["if_count"],
+            for_count=row["for_count"],
+            while_count=row["while_count"],
+            try_count=row["try_count"],
+            with_count=row["with_count"],
+            match_count=row["match_count"],
+            return_count=row["return_count"],
+            call_count=row["call_count"],
+            max_nesting_depth=row["max_nesting_depth"],
+            cyclomatic_complexity=row["cyclomatic_complexity"],
+        )
+
+    def list_all_function_metrics(self, rid: str) -> list[FunctionMetricsRecord]:
+        """All function metrics of the latest completed run (bounded by run size)."""
+        out: list[FunctionMetricsRecord] = []
+        offset = 0
+        while True:
+            items, total = self.list_function_metrics(rid, limit=_MAX_PAGE, offset=offset)
+            out.extend(items)
+            offset += len(items)
+            if not items or offset >= total:
+                break
+        return out
+
+    def list_all_symbols(self, rid: str) -> list[SymbolRecord]:
+        """All symbols of the latest completed run."""
+        out: list[SymbolRecord] = []
+        offset = 0
+        while True:
+            page = self.list_symbols(rid, limit=_MAX_PAGE, offset=offset)
+            out.extend(page.items)
+            offset += len(page.items)
+            if not page.items or offset >= page.page.total:
+                break
+        return out
+
+    def list_all_relationships(self, rid: str) -> list[RelationshipRecord]:
+        """All relationships of the latest completed run."""
+        out: list[RelationshipRecord] = []
+        offset = 0
+        while True:
+            page = self.list_relationships(rid, limit=_MAX_PAGE, offset=offset)
+            out.extend(page.items)
+            offset += len(page.items)
+            if not page.items or offset >= page.page.total:
+                break
+        return out
 
     def list_relationships(
         self,

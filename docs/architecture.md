@@ -1,7 +1,7 @@
-# RepoLens — Phase 1 Architecture
+# RepoLens — Architecture (Phase 1 and Phase 2)
 
-Status: approved design for Phase 1 implementation.
-Scope: repository ingestion, Python static analysis, graph construction, persistence, HTTP API.
+Status: approved Phase 1 design, with Phase 2 comprehension sections 15.1–15.5.
+Scope: repository ingestion, Python static analysis, graph construction, persistence, HTTP API, and deterministic comprehension.
 
 ## 0. Non-negotiable constraints
 
@@ -132,7 +132,7 @@ redefinition is added/removed (ordinal shift). This is documented, not over-prom
 Raw stdlib `sqlite3` (decision AD-5). One database file, configured via
 `REPOLENS_DB_PATH` (default `repolens.db`). Every connection: `PRAGMA foreign_keys=ON`,
 `journal_mode=WAL`, `row_factory=sqlite3.Row`. Schema created idempotently at startup;
-`schema_meta` table records `schema_version` (currently `1`) as the migration hook.
+`schema_meta` table records `schema_version` (currently `2`) and drives additive migrations.
 
 Tables (columns abbreviated; exact DDL in `repolens/persistence/database.py`):
 
@@ -385,6 +385,13 @@ pydantic-settings dependency — fewer moving parts, trivially injectable in tes
 | `REPOLENS_MAX_FILES` | `5000` |
 | `REPOLENS_PATH_MAX_DEPTH` | `6` (hard cap 10) |
 | `REPOLENS_PATH_MAX_NODES` | `20000` |
+| `REPOLENS_TRACE_MAX_DEPTH` | `4` (hard cap 8) |
+| `REPOLENS_TRACE_MAX_NODES` | `500` (hard cap 5 000) |
+| `REPOLENS_SEARCH_MAX_FILES` | `2000` |
+| `REPOLENS_SEARCH_MAX_HITS` | `1000` |
+| `REPOLENS_COMPLEXITY_WARNING_THRESHOLD` | `10` |
+| `REPOLENS_FAN_OUT_WARNING_THRESHOLD` | `10` |
+| `REPOLENS_FAN_IN_WARNING_THRESHOLD` | `10` |
 | `REPOLENS_LOG_LEVEL` | `INFO` |
 
 Run: `python -m repolens.main` (uvicorn, configurable host/port env
@@ -427,3 +434,128 @@ reported honestly).
 - **AD-12** Encoding: BOM sniff UTF-8/16, else strict UTF-8; failures per-file.
 - **AD-13** Symlinks: never traverse directory symlinks; file symlinks only inside root.
 - **AD-14** Path queries: BFS with depth cap (default 6, max 10) and visited cap 20 000.
+
+## 15. Phase 2 comprehension architecture
+
+Phase 2 is layered on the Phase 1 facts without changing the ingestion,
+parsing, symbol, resolution, graph, or storage contracts. It adds deterministic
+analysis modules, services, routes, and one persisted table.
+
+### 15.1 Module map
+
+| Layer | Modules | Responsibility |
+|---|---|---|
+| Analysis | `analysis/function_metrics.py` | Per-function structural metrics from the AST |
+| Analysis | `analysis/cfg.py` | Per-function control-flow graph and def/use node facts |
+| Analysis | `analysis/dataflow.py` | Bounded intraprocedural reaching definitions and def-use |
+| Analysis | `analysis/function_locator.py` | Locate a persisted symbol's function node in current source |
+| Analysis | `analysis/entrypoints.py` | Explicit `__main__` guard / `__main__.py` detection |
+| Analysis | `analysis/explanations.py` | Deterministic five-level explanation templates |
+| Analysis | `analysis/search.py` | Lexical symbol/text/token matching, scoring, pagination |
+| Analysis | `analysis/tracing.py` | Bounded forward/reverse/both relationship traversal |
+| Analysis | `analysis/architecture.py` | Import graph, cycles, centrality, coupling, hotspots, findings |
+| Services | `services/comprehension_service.py` | Symbol→file→source→CFG→dataflow→explanations orchestration |
+| Services | `services/search_service.py` | Latest-run symbol loading + bounded current-source text search |
+| Services | `services/trace_service.py` | Symbol/file trace loading, traversal, connect, dependents |
+| Services | `services/architecture_service.py` | Latest-run facts → architecture summary and findings |
+| API | `api/routes/metrics.py`, `cfg.py`, `explanations.py`, `search.py`, `trace.py`, `architecture.py` | Thin HTTP adapters, query validation, pagination |
+| Persistence | `persistence/database.py` | Schema v2 + additive `function_metrics.symbol_id`/`statement_count` migration |
+
+`api/deps.py` wires the services from the existing `AnalysisService`, database,
+and frozen `Settings`. New domain errors (`source_unavailable`,
+`analysis_not_available`, `invalid_request`) are mapped in `main.py` to 409, 404,
+and 400 respectively.
+
+### 15.2 On-demand comprehension pipeline
+
+Only function metrics are persisted. CFG, data flow, explanations, search, trace
+and architecture are computed when requested:
+
+```text
+persisted symbol / run facts
+        │
+        ├── metrics endpoint ──► function_metrics rows (persisted)
+        │
+        ├── CFG/dataflow/explanation
+        │       symbol ──► file record ──► boundary-checked source read
+        │              ──► ast.parse ──► locate function by line/name
+        │              ──► build CFG ──► def/use facts ──► dataflow
+        │              ──► deterministic explanation
+        │
+        ├── search
+        │       stored symbols + current source of parsed latest-run files
+        │
+        ├── trace
+        │       persisted relationships ──► resolved-static BFS
+        │
+        └── architecture
+                persisted files/symbols/relationships/metrics
+                ──► resolved-static import graph ──► cycles/centrality/coupling
+```
+
+This deliberately avoids a second source of truth. On-demand results report
+`source_changed_since_analysis` when the current hash differs from the analyzed
+hash, and `source_unavailable` when source cannot be read. Source is read through
+the same containment checks as Phase 1; no endpoint returns an absolute host
+path.
+
+### 15.3 Persistence changes
+
+Schema version is **2**. The only new persisted product is `function_metrics`:
+
+| Column | Meaning |
+|---|---|
+| `id` | Autoincrement primary key |
+| `repository_id`, `run_id`, `file_id` | Run/file association |
+| `symbol_id` | Function symbol association (string, not a FK) |
+| `qualified_name`, `start_line`, `end_line` | Source identity/range |
+| `parameter_count`, `line_count`, `statement_count` | Size and own-scope statement count |
+| `if_count`, `for_count`, `while_count`, `try_count`, `with_count`, `match_count`, `return_count`, `call_count` | Structural counts |
+| `max_nesting_depth` | Control-flow nesting |
+| `cyclomatic_complexity` | AST decision-point approximation |
+
+Indexes cover `(run_id)`, `(repository_id, run_id)`, and `(symbol_id)`.
+`symbol_id` is populated during `pipeline._assign_ids` after symbol IDs exist.
+The additive migration adds the column to databases created before Phase 2; it
+does not rewrite existing rows. Metric rows follow the Phase 1 atomic detail-swap
+and latest-completed-run rules, so old metrics never leak into a new run and a
+failed re-analysis leaves the previous completed run queryable.
+
+### 15.4 Determinism and bounds
+
+- Every traversal uses sorted frontiers / source order; IDs are stable hashes or
+  deterministic sequences (`n0…`, `d0…`, `u0…`).
+- Cycles are canonically rotated and sorted before evidence is emitted.
+- Search ties break on path, line, kind, qualified name and snippet.
+- Architecture findings sort by severity, kind, subject and id.
+- Every analysis cap that can omit results (CFG nodes/edges/depth, data-flow
+  definitions/uses/iterations, trace depth/nodes, search files/hits, cycle
+  count/length, findings) sets an explicit `truncated` flag and/or note. A cap is
+  not evidence of absence. Display-only top-N lists (central components,
+  hotspots, coupling rows) are documented response shapes, not completeness
+  claims.
+- Analysis never imports, executes, or mutates analyzed code. The E2E fixture
+  writes a marker only if executed; the test asserts it is absent.
+
+### 15.5 Phase 2 decisions
+
+- **AD-15** Persist only function metrics; derive CFG/data flow/explanations/
+  search/trace/architecture on demand. This trades repeated computation for no
+  stale derived state and a smaller schema.
+- **AD-16** Cyclomatic complexity remains an AST decision-point approximation,
+  not a CFG number, and is never a defect verdict.
+- **AD-17** CFG exception edges are conservative (try-body nodes → every
+  handler); exception types and `finally` routing for `return`/`break`/`continue`
+  are explicitly not modelled.
+- **AD-18** Data flow is local may-reaching-definitions only. No interprocedural,
+  alias, points-to or whole-program claims.
+- **AD-19** Tracing follows only `resolved_static` relationships and reports all
+  other statuses; a trace is a static relationship path, not a runtime trace.
+- **AD-20** Architecture uses resolved-static imports only. Degree
+  centrality/coupling are structural indicators; cycles are objective facts but
+  not defect labels.
+- **AD-21** Search is lexical and deterministic; no embeddings or semantic
+  similarity. Text search reads current source only for parsed latest-run files
+  and reports truncation.
+- **AD-22** Explanations separate facts, heuristics, unknowns and evidence.
+  Templates never invent intent; missing/approximate results are stated.

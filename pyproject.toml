@@ -1,7 +1,7 @@
 [project]
 name = "repolens"
 version = "0.1.0"
-description = "RepoLens Phase 1: no-LLM repository ingestion, Python static analysis, graph construction, persistence, and API."
+description = "RepoLens: no-LLM Python repository ingestion, static analysis, graph construction, persistence, and deterministic comprehension API."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
